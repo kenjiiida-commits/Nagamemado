@@ -1,0 +1,13 @@
+[Desktop Entry]
+Type=Application
+Name=ながめ窓
+Name[ja]=ながめ窓
+GenericName=写真閲覧
+Comment=写真をサムネイル一覧で見て、大きく表示・スライドショーができます
+Exec=nagamemado %f
+Icon=nagamemado
+Terminal=false
+Categories=Graphics;Viewer;Photography;Qt;
+Keywords=photo;image;viewer;写真;画像;ビューア;スライドショー;
+MimeType=image/jpeg;image/png;image/gif;image/bmp;image/webp;image/tiff;image/heif;image/avif;image/x-tga;image/x-portable-pixmap;image/svg+xml;
+StartupWMClass=nagamemado

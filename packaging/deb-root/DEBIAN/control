@@ -1,0 +1,12 @@
+Package: nagamemado
+Version: 0.1.0
+Section: graphics
+Priority: optional
+Architecture: all
+Depends: python3, python3-pyside6.qtcore, python3-pyside6.qtgui, python3-pyside6.qtwidgets
+Recommends: python3-pil, qt6-image-formats-plugins, libqt6svg6
+Maintainer: Kenji Iida <kenjiiida-commits@users.noreply.github.com>
+Homepage: https://github.com/kenjiiida-commits/Nagamemado
+Description: ながめ窓 - Ubuntu用の写真閲覧ソフト
+ フォルダの写真をサムネイル一覧で表示し、大きく表示（拡大縮小・回転・全画面）、
+ 撮影情報（EXIF）の表示、スライドショー、ゴミ箱へ・名前変更・コピー・移動ができます。
