@@ -15,6 +15,9 @@ License: MIT
 import os
 import re
 import math
+import hashlib
+import threading
+import urllib.parse
 import sys
 import shutil
 import subprocess
@@ -40,7 +43,7 @@ from PySide6.QtWidgets import (
     QDockWidget, QTextBrowser, QVBoxLayout, QHBoxLayout, QGraphicsView,
     QGraphicsScene, QGraphicsPixmapItem, QMessageBox, QInputDialog,
     QFileDialog, QAbstractItemView, QStyle, QToolButton, QFrame, QSizePolicy,
-    QCheckBox,
+    QCheckBox, QStyledItemDelegate, QMenu,
 )
 
 try:
@@ -51,12 +54,13 @@ except Exception:  # Pillow が無くても動くようにする
 
 APP_NAME = "ながめ窓"
 APP_ID = "nagamemado"
-VERSION = "0.3.0"
+VERSION = "0.4.0"
 
 PATH_ROLE = Qt.UserRole + 1
 SIZE_ROLE = Qt.UserRole + 2
 MTIME_ROLE = Qt.UserRole + 3
 THUMB_ROLE = Qt.UserRole + 4   # 読み込み済みサムネイルの大きさ
+HEADER_ROLE = Qt.UserRole + 5  # 「2026年10月」などの区切り見出し
 
 # 大きな写真（1億画素など）も開けるように、読み込み上限を広げる（MB）
 QImageReader.setAllocationLimit(2048)
@@ -142,6 +146,233 @@ def load_image(path):
 
 
 # ----------------------------------------------------------------------
+# サムネイルの保存（Ubuntu標準の ~/.cache/thumbnails を使う。「ファイル」アプリと共有）
+# ----------------------------------------------------------------------
+THUMB_ROOT = os.path.join(os.environ.get("XDG_CACHE_HOME") or os.path.expanduser("~/.cache"),
+                          "thumbnails")
+THUMB_CACHE_ON = True
+_THUMB_DIRS = ("normal", "large", "x-large", "xx-large")
+
+
+def file_uri(path):
+    return "file://" + urllib.parse.quote(os.path.abspath(path), safe="/!$&'()*+,;=:@")
+
+
+def thumb_cache_path(path, bucket_dir):
+    h = hashlib.md5(file_uri(path).encode("utf-8")).hexdigest()
+    return os.path.join(THUMB_ROOT, bucket_dir, h + ".png")
+
+
+def forget_thumbnails(path):
+    """保存してあるサムネイルを消す（回転したときなど）"""
+    for d in _THUMB_DIRS:
+        try:
+            os.remove(thumb_cache_path(path, d))
+        except OSError:
+            pass
+
+
+def _fit(img, size):
+    if not img.isNull() and (img.width() > size or img.height() > size):
+        return img.scaled(size, size, Qt.KeepAspectRatio, Qt.SmoothTransformation)
+    return img
+
+
+def make_thumbnail(path, size):
+    """サムネイルを返す。保存済みがあれば使い、無ければ作って保存する"""
+    bucket, bdir = (256, "large") if size <= 256 else (512, "x-large")
+    try:
+        st = os.stat(path)
+    except OSError:
+        return QImage()
+    use_cache = THUMB_CACHE_ON and not os.path.abspath(path).startswith(THUMB_ROOT + os.sep)
+    uri = file_uri(path)
+    mtime = str(int(st.st_mtime))
+    fn = thumb_cache_path(path, bdir)
+    if use_cache and os.path.exists(fn):
+        img = QImage(fn)
+        if not img.isNull() and img.text("Thumb::MTime") == mtime and img.text("Thumb::URI") == uri:
+            return _fit(img, size)
+    reader = QImageReader(path)
+    reader.setAutoTransform(True)
+    sz = reader.size()
+    if sz.isValid() and (sz.width() > bucket or sz.height() > bucket):
+        reader.setScaledSize(sz.scaled(bucket, bucket, Qt.KeepAspectRatio))
+    img = _fit(reader.read(), bucket)
+    if img.isNull():
+        return img
+    if use_cache:
+        try:
+            os.makedirs(os.path.dirname(fn), mode=0o700, exist_ok=True)
+            out = img.convertToFormat(QImage.Format_ARGB32) if img.hasAlphaChannel() else img
+            out.setText("Thumb::URI", uri)
+            out.setText("Thumb::MTime", mtime)
+            out.setText("Thumb::Size", str(st.st_size))
+            out.setText("Software", f"Nagamemado {VERSION}")
+            tmp = f"{fn}.{os.getpid()}.{threading.get_ident()}.tmp"
+            if out.save(tmp, "PNG"):
+                os.chmod(tmp, 0o600)
+                os.replace(tmp, fn)
+        except OSError:
+            pass
+    return _fit(img, size)
+
+
+# ----------------------------------------------------------------------
+# 回転して保存
+# ----------------------------------------------------------------------
+JPEG_EXTS = {".jpg", ".jpeg", ".jpe", ".jfif"}
+PIL_SAVE = {".png": "PNG", ".bmp": "BMP", ".tif": "TIFF", ".tiff": "TIFF", ".webp": "WEBP"}
+_ROT_CW = {1: 6, 6: 3, 3: 8, 8: 1}
+_ROT_CCW = {1: 8, 8: 3, 3: 6, 6: 1}
+
+
+def can_rotate_save(path):
+    ext = os.path.splitext(path)[1].lower()
+    return ext in JPEG_EXTS or (HAS_PIL and ext in PIL_SAVE)
+
+
+def _jpeg_find_orientation(data):
+    """JPEGの中の「向き」情報の場所を探す。
+    戻り値: ("tag", 位置, バイト順, 今の値) / ("noexif", SOIの後の挿入位置) / ("other",)"""
+    if data[:2] != b"\xff\xd8":
+        return ("bad",)
+    i, insert_at = 2, 2
+    while i + 4 <= len(data):
+        if data[i] != 0xFF:
+            return ("bad",)
+        marker = data[i + 1]
+        if marker in (0xD9, 0xDA):
+            break
+        seglen = int.from_bytes(data[i + 2:i + 4], "big")
+        if marker == 0xE0:
+            insert_at = i + 2 + seglen     # JFIF の後ろに入れる
+        if marker == 0xE1 and data[i + 4:i + 10] == b"Exif\x00\x00":
+            t = i + 10
+            bo = {b"II": "little", b"MM": "big"}.get(bytes(data[t:t + 2]))
+            if bo is None:
+                return ("other",)
+            ifd0 = t + int.from_bytes(data[t + 4:t + 8], bo)
+            n = int.from_bytes(data[ifd0:ifd0 + 2], bo)
+            for k in range(n):
+                e = ifd0 + 2 + 12 * k
+                if int.from_bytes(data[e:e + 2], bo) == 0x0112:
+                    if int.from_bytes(data[e + 2:e + 4], bo) != 3:
+                        return ("exifnotag", i, i + 2 + seglen)
+                    return ("tag", e + 8, bo, int.from_bytes(data[e + 8:e + 10], bo))
+            return ("exifnotag", i, i + 2 + seglen)
+        i += 2 + seglen
+    return ("noexif", insert_at)
+
+
+def _exif_orientation_segment(value):
+    tiff = (b"MM\x00\x2a\x00\x00\x00\x08" + (1).to_bytes(2, "big") +
+            (0x0112).to_bytes(2, "big") + (3).to_bytes(2, "big") + (1).to_bytes(4, "big") +
+            value.to_bytes(2, "big") + b"\x00\x00" + (0).to_bytes(4, "big"))
+    payload = b"Exif\x00\x00" + tiff
+    return b"\xff\xe1" + (len(payload) + 2).to_bytes(2, "big") + payload
+
+
+def _write_atomic(path, data, mode):
+    tmp = f"{path}.nagamemado.tmp"
+    with open(tmp, "wb") as f:
+        f.write(data)
+    os.chmod(tmp, mode)
+    os.replace(tmp, path)
+
+
+def rotate_and_save(path, cw=True):
+    """写真を90度回転して保存する。戻り値 (成功したか, 説明)"""
+    ext = os.path.splitext(path)[1].lower()
+    try:
+        st = os.stat(path)
+    except OSError as e:
+        return False, str(e)
+    how = ""
+    try:
+        done = False
+        if ext in JPEG_EXTS:
+            with open(path, "rb") as f:
+                data = bytearray(f.read())
+            found = _jpeg_find_orientation(data)
+            table = _ROT_CW if cw else _ROT_CCW
+            if found[0] == "tag" and found[3] in table:
+                pos, bo = found[1], found[2]
+                data[pos:pos + 2] = table[found[3]].to_bytes(2, bo)
+                _write_atomic(path, bytes(data), st.st_mode & 0o7777)
+                done, how = True, "画質はそのまま（向きの情報だけ変更）"
+            elif found[0] == "noexif":
+                at = found[1]
+                data[at:at] = _exif_orientation_segment(table[1])
+                _write_atomic(path, bytes(data), st.st_mode & 0o7777)
+                done, how = True, "画質はそのまま（向きの情報を追加）"
+            elif found[0] == "exifnotag" and HAS_PIL:
+                # EXIF はあるが向きの情報が無い：EXIF の部分だけ作り直す（写真の中身はそのまま）
+                a, b = found[1], found[2]
+                ex = Image.Exif()
+                ex.load(bytes(data[a + 10:b]))
+                for ifd in (0x8769, 0x8825, 0xA005):
+                    try:
+                        ex.get_ifd(ifd)
+                    except Exception:
+                        pass
+                cur = ex.get(0x0112, 1)
+                if cur in table:
+                    ex[0x0112] = table[cur]
+                    payload = ex.tobytes()
+                    if not payload.startswith(b"Exif\x00\x00"):
+                        payload = b"Exif\x00\x00" + payload
+                    if len(payload) + 2 <= 0xFFFF:
+                        seg = b"\xff\xe1" + (len(payload) + 2).to_bytes(2, "big") + payload
+                        data[a:b] = seg
+                        _write_atomic(path, bytes(data), st.st_mode & 0o7777)
+                        done, how = True, "画質はそのまま（向きの情報を追加）"
+        if not done:
+            if not HAS_PIL or (ext not in JPEG_EXTS and ext not in PIL_SAVE):
+                return False, "この形式の写真は回転して保存できません"
+            from PIL import ImageOps
+            with Image.open(path) as im:
+                if getattr(im, "n_frames", 1) > 1:
+                    return False, "動く画像は回転して保存できません"
+                im.load()
+                icc = im.info.get("icc_profile")
+                exif = im.getexif()
+                fmt = "JPEG" if ext in JPEG_EXTS else PIL_SAVE[ext]
+                out = ImageOps.exif_transpose(im)
+                out = out.transpose(Image.Transpose.ROTATE_270 if cw else Image.Transpose.ROTATE_90)
+            exif[0x0112] = 1
+            kw = {"exif": exif.tobytes()}
+            if icc:
+                kw["icc_profile"] = icc
+            if fmt == "JPEG":
+                kw.update(quality=95, subsampling=0)
+                if out.mode not in ("RGB", "L", "CMYK"):
+                    out = out.convert("RGB")
+                how = "高画質で保存し直しました"
+            elif fmt == "WEBP":
+                kw.update(quality=95)
+                how = "高画質で保存し直しました"
+            else:
+                how = "画質はそのまま（保存し直し）"
+            tmp = f"{path}.nagamemado.tmp"
+            out.save(tmp, fmt, **kw)
+            os.chmod(tmp, st.st_mode & 0o7777)
+            os.replace(tmp, path)
+    except Exception as e:
+        try:
+            os.remove(f"{path}.nagamemado.tmp")
+        except OSError:
+            pass
+        return False, f"保存できませんでした：{e}"
+    try:
+        os.utime(path, (st.st_atime, st.st_mtime))   # 更新日時は元のまま
+    except OSError:
+        pass
+    forget_thumbnails(path)
+    return True, how
+
+
+# ----------------------------------------------------------------------
 # 撮影情報（EXIF）
 # ----------------------------------------------------------------------
 FLASH_TEXT = {0: "発光なし", 1: "発光", 5: "発光（反射光なし）", 7: "発光（反射光あり）",
@@ -179,27 +410,148 @@ def _dms_to_deg(dms, ref):
         return None
 
 
+HEIF_EXTS = {".heic", ".heif", ".hif", ".avif"}
+
+
+def _iso_boxes(data, start, end):
+    """HEIC（ISOBMFF形式）の箱を順に取り出す"""
+    i = start
+    while i + 8 <= end:
+        size = int.from_bytes(data[i:i + 4], "big")
+        typ = bytes(data[i + 4:i + 8])
+        hdr = 8
+        if size == 1:
+            size = int.from_bytes(data[i + 8:i + 16], "big")
+            hdr = 16
+        elif size == 0:
+            size = end - i
+        if size < hdr or i + size > end:
+            break
+        yield typ, i + hdr, i + size
+        i += size
+
+
+def heif_exif_bytes(path):
+    """HEIC ファイルの中から EXIF（TIFF形式）の部分を取り出す。無ければ None"""
+    with open(path, "rb") as f:
+        head = f.read(4 * 1024 * 1024)
+        meta = None
+        for typ, st, en in _iso_boxes(head, 0, len(head)):
+            if typ == b"meta":
+                meta = (st + 4, en)
+                break
+        if meta is None:
+            return None
+        exif_id, locs = None, {}
+        for typ, st, en in _iso_boxes(head, *meta):
+            if typ == b"iinf":
+                ver = head[st]
+                q = st + 4 + (2 if ver == 0 else 4)
+                for t2, s2, _e2 in _iso_boxes(head, q, en):
+                    if t2 != b"infe" or head[s2] < 2:
+                        continue
+                    v, r = head[s2], s2 + 4
+                    if v == 2:
+                        iid = int.from_bytes(head[r:r + 2], "big")
+                        r += 2
+                    else:
+                        iid = int.from_bytes(head[r:r + 4], "big")
+                        r += 4
+                    r += 2   # item_protection_index
+                    if head[r:r + 4] == b"Exif":
+                        exif_id = iid
+            elif typ == b"iloc":
+                ver = head[st]
+                pos = [st + 4]
+
+                def rd(n):
+                    v = int.from_bytes(head[pos[0]:pos[0] + n], "big") if n else 0
+                    pos[0] += n
+                    return v
+                b1, b2 = rd(1), rd(1)
+                off_sz, len_sz, base_sz = b1 >> 4, b1 & 15, b2 >> 4
+                idx_sz = (b2 & 15) if ver in (1, 2) else 0
+                count = rd(2) if ver < 2 else rd(4)
+                for _ in range(count):
+                    iid = rd(2) if ver < 2 else rd(4)
+                    method = rd(2) & 15 if ver in (1, 2) else 0
+                    rd(2)    # data_reference_index
+                    base = rd(base_sz)
+                    exts = []
+                    for _ in range(rd(2)):
+                        rd(idx_sz)
+                        exts.append((base + rd(off_sz), rd(len_sz)))
+                    locs[iid] = (method, exts)
+        if exif_id is None or exif_id not in locs or locs[exif_id][0] != 0:
+            return None
+        buf = b""
+        for off, ln in locs[exif_id][1]:
+            f.seek(off)
+            buf += f.read(ln)
+    if len(buf) < 8:
+        return None
+    skip = int.from_bytes(buf[0:4], "big")
+    tiff = buf[4 + skip:]
+    return tiff if tiff[:2] in (b"II", b"MM") else None
+
+
+def get_exif(path):
+    """EXIF を {"base": 基本, "exif": 撮影情報, "gps": 位置情報} の辞書で返す。無ければ None"""
+    if not HAS_PIL:
+        return None
+    try:
+        if os.path.splitext(path)[1].lower() in HEIF_EXTS:
+            raw = heif_exif_bytes(path)
+            if not raw:
+                return None
+            ex = Image.Exif()
+            ex.load(raw)
+        else:
+            im = Image.open(path)
+            try:
+                ex = im.getexif()
+            except Exception:
+                im.close()
+                return None
+            out = _exif_dict(ex)
+            im.close()
+            return out
+        return _exif_dict(ex)
+    except Exception:
+        return None
+
+
+def _exif_dict(ex):
+    if not ex:
+        return None
+    base = dict(ex)
+    try:
+        sub = dict(ex.get_ifd(0x8769))
+    except Exception:
+        sub = {}
+    try:
+        gps = dict(ex.get_ifd(0x8825))
+    except Exception:
+        gps = {}
+    return {"base": base, "exif": sub, "gps": gps}
+
+
+def read_taken(path):
+    """撮影日時 'YYYY:MM:DD HH:MM:SS'（無ければ空文字）"""
+    d = get_exif(path)
+    if not d:
+        return ""
+    dt = _clean(d["exif"].get(36867) or d["base"].get(306) or "")
+    return dt if re.match(r"^\d{4}:\d{2}:\d{2}", dt) else ""
+
+
 def read_exif(path):
     """(見出し, 値) のリストと、GPS座標（あれば）を返す"""
     rows, gps_pos = [], None
-    if not HAS_PIL:
+    d = get_exif(path)
+    if not d:
         return rows, gps_pos
-    try:
-        with Image.open(path) as im:
-            ex = im.getexif()
-            if not ex:
-                return rows, gps_pos
-            base = dict(ex)
-            try:
-                sub = dict(ex.get_ifd(0x8769))
-            except Exception:
-                sub = {}
-            try:
-                gps = dict(ex.get_ifd(0x8825))
-            except Exception:
-                gps = {}
-    except Exception:
-        return rows, gps_pos
+    base, sub, gps = d["base"], d["exif"], d["gps"]
 
     def g(tag):
         return sub.get(tag, base.get(tag))
@@ -355,14 +707,7 @@ class ThumbTask(QRunnable):
     def run(self):
         img = QImage()
         try:
-            reader = QImageReader(self.path)
-            reader.setAutoTransform(True)
-            s = reader.size()
-            if s.isValid() and (s.width() > self.size or s.height() > self.size):
-                reader.setScaledSize(s.scaled(self.size, self.size, Qt.KeepAspectRatio))
-            img = reader.read()
-            if not img.isNull() and (img.width() > self.size or img.height() > self.size):
-                img = img.scaled(self.size, self.size, Qt.KeepAspectRatio, Qt.SmoothTransformation)
+            img = make_thumbnail(self.path, self.size)
         except Exception:
             pass
         try:
@@ -494,6 +839,7 @@ class ImageView(QGraphicsView):
 class ViewerWindow(QMainWindow):
     currentChanged = Signal(str)
     fileTrashed = Signal(str)
+    fileRotated = Signal(str)
 
     CACHE_MAX = 6
 
@@ -586,10 +932,13 @@ class ViewerWindow(QMainWindow):
                                theme_icon(["zoom-fit-best"], S.SP_TitleBarMaxButton))
         self.a_1x = self._act("等倍", ["1"], self.view.actual_size,
                               theme_icon(["zoom-original"], S.SP_TitleBarNormalButton))
-        self.a_rl = self._act("左回転", ["L", "Ctrl+L"], lambda: self.view.rotate_by(-90),
+        self.a_rl = self._act("左回転", ["L", "Ctrl+L"], lambda: self._rotate(-90),
                               theme_icon(["object-rotate-left"], S.SP_BrowserReload))
-        self.a_rr = self._act("右回転", ["R", "Ctrl+R"], lambda: self.view.rotate_by(90),
+        self.a_rr = self._act("右回転", ["R", "Ctrl+R"], lambda: self._rotate(90),
                               theme_icon(["object-rotate-right"], S.SP_BrowserReload))
+        self.a_saverot = self._act("向きを保存", ["Ctrl+S"], self.save_rotation,
+                                   theme_icon(["document-save"], S.SP_DialogSaveButton))
+        self.a_saverot.setEnabled(False)
         self.a_slide = self._act("スライドショー", ["S", "F5"], self.toggle_slideshow,
                                  theme_icon(["media-playback-start"], S.SP_MediaPlay), True)
         self.a_full = self._act("全画面", ["F", "F11"], self.toggle_fullscreen,
@@ -601,7 +950,7 @@ class ViewerWindow(QMainWindow):
         self.a_close = self._act("閉じる", ["Esc"], self.on_escape)
 
         for a in (self.a_prev, self.a_next, None, self.a_zout, self.a_zin, self.a_fit,
-                  self.a_1x, None, self.a_rl, self.a_rr, None, self.a_slide, self.a_full,
+                  self.a_1x, None, self.a_rl, self.a_rr, self.a_saverot, None, self.a_slide, self.a_full,
                   self.a_info, None, self.a_trash):
             if a is None:
                 tb.addSeparator()
@@ -660,6 +1009,7 @@ class ViewerWindow(QMainWindow):
         path = self.paths[i]
         img = self._get_image(path)
         self.view.set_image(img)
+        self.a_saverot.setEnabled(False)
         if img.isNull():
             self.show_toast("この画像は開けませんでした")
         self.setWindowTitle(f"{os.path.basename(path)} - {APP_NAME}")
@@ -688,6 +1038,37 @@ class ViewerWindow(QMainWindow):
             self.show_index(self.index - 1)
         else:
             self.show_toast("最初の写真です")
+
+    # --- 回転して保存 ---
+    def _rotate(self, deg):
+        self.view.rotate_by(deg)
+        rot = self.view._rot
+        p = self.paths[self.index] if 0 <= self.index < len(self.paths) else ""
+        self.a_saverot.setEnabled(rot != 0 and can_rotate_save(p))
+        if rot != 0 and can_rotate_save(p):
+            self.show_toast("この向きで保存するには Ctrl+S（「向きを保存」）", 2200)
+
+    def save_rotation(self):
+        if not (0 <= self.index < len(self.paths)):
+            return
+        rot = self.view._rot
+        if rot == 0:
+            return
+        path = self.paths[self.index]
+        steps = {90: [True], 180: [True, True], 270: [False]}[rot]
+        ok, how = True, ""
+        for cw in steps:
+            ok, how = rotate_and_save(path, cw)
+            if not ok:
+                break
+        if not ok:
+            QMessageBox.warning(self, "向きを保存", how)
+            return
+        self._cache.pop(path, None)
+        self._pending.discard(path)
+        self.show_index(self.index)
+        self.fileRotated.emit(path)
+        self.show_toast(f"向きを保存しました ― {how}", 2500)
 
     def show_toast(self, text, ms=1500):
         self.toast.setText(text)
@@ -862,31 +1243,21 @@ class HoverPopup(QLabel):
 # ----------------------------------------------------------------------
 def read_gps(path):
     """(緯度, 経度, 撮影日時文字列) を返す。位置情報が無ければ None"""
-    if not HAS_PIL:
+    d = get_exif(path)
+    if not d:
         return None
+    gps = d["gps"]
     try:
-        with Image.open(path) as im:
-            ex = im.getexif()
-            if not ex:
-                return None
-            try:
-                gps = dict(ex.get_ifd(0x8825))
-            except Exception:
-                return None
-            if 2 not in gps or 4 not in gps:
-                return None
-            lat = _dms_to_deg(gps[2], gps.get(1, "N"))
-            lon = _dms_to_deg(gps[4], gps.get(3, "E"))
-            if lat is None or lon is None or (abs(lat) < 1e-6 and abs(lon) < 1e-6):
-                return None
-            if not (-90 <= lat <= 90 and -180 <= lon <= 180):
-                return None
-            try:
-                sub = dict(ex.get_ifd(0x8769))
-            except Exception:
-                sub = {}
-            dt = _clean(sub.get(36867) or ex.get(306) or "")
-            return lat, lon, dt
+        if 2 not in gps or 4 not in gps:
+            return None
+        lat = _dms_to_deg(gps[2], gps.get(1, "N"))
+        lon = _dms_to_deg(gps[4], gps.get(3, "E"))
+        if lat is None or lon is None or (abs(lat) < 1e-6 and abs(lon) < 1e-6):
+            return None
+        if not (-90 <= lat <= 90 and -180 <= lon <= 180):
+            return None
+        dt = _clean(d["exif"].get(36867) or d["base"].get(306) or "")
+        return lat, lon, dt
     except Exception:
         return None
 
@@ -1611,6 +1982,63 @@ class MapWindow(QMainWindow):
 
 
 # ----------------------------------------------------------------------
+# 一覧の見た目（「2026年10月」の見出しを1行まるごと使って表示）
+# ----------------------------------------------------------------------
+class ThumbDelegate(QStyledItemDelegate):
+    def __init__(self, view, main):
+        super().__init__(view)
+        self.view, self.main = view, main
+
+    def sizeHint(self, option, index):
+        if index.data(HEADER_ROLE):
+            w = self.view.viewport().width() - 2 * self.view.spacing() - 2
+            return QSize(max(120, w), self.view.fontMetrics().height() + 22)
+        s = self.main.thumb_size
+        return QSize(s + 20, s + self.view.fontMetrics().height() + 16)
+
+    def paint(self, p, option, index):
+        if not index.data(HEADER_ROLE):
+            return super().paint(p, option, index)
+        p.save()
+        r = option.rect
+        f = QFont(option.font)
+        f.setBold(True)
+        f.setPointSizeF(f.pointSizeF() * 1.15)
+        p.setFont(f)
+        p.setPen(option.palette.color(option.palette.ColorRole.Text))
+        p.drawText(r.adjusted(8, 0, -8, -6), Qt.AlignLeft | Qt.AlignBottom, index.data(Qt.DisplayRole))
+        p.setPen(QPen(QColor(128, 128, 128, 110), 1))
+        p.drawLine(r.left() + 6, r.bottom() - 2, r.right() - 6, r.bottom() - 2)
+        p.restore()
+
+
+class DateSignals(QObject):
+    done = Signal(int, dict)
+
+
+class DateScanTask(QRunnable):
+    """撮影日時を裏で読み取る"""
+    def __init__(self, gen, items, signals):
+        super().__init__()
+        self.gen, self.items, self.signals = gen, items, signals
+        self.cancelled = False
+
+    def run(self):
+        res = {}
+        for path, mtime in self.items:
+            if self.cancelled:
+                return
+            res[path] = (mtime, read_taken(path))
+        try:
+            self.signals.done.emit(self.gen, res)
+        except RuntimeError:
+            pass
+
+
+SORT_MODES = [("name", "名前"), ("taken", "撮影日時"), ("mtime", "更新日時"), ("size", "サイズ")]
+
+
+# ----------------------------------------------------------------------
 # メイン窓（フォルダ＋サムネイル一覧）
 # ----------------------------------------------------------------------
 class MainWindow(QMainWindow):
@@ -1631,6 +2059,17 @@ class MainWindow(QMainWindow):
         self.viewer = None
         self.map_win = None
         self._placeholder = None
+        self.entries = []           # 今のフォルダの写真 (名前, サイズ, 更新日時)
+        self.taken_cache = {}       # path -> (更新日時, 撮影日時)
+        self.date_gen = 0
+        self.date_task = None
+        self.date_pool = QThreadPool(self)
+        self.date_pool.setMaxThreadCount(1)
+        self.date_signals = DateSignals()
+        self.date_signals.done.connect(self._on_dates)
+        self._hint = ""
+        global THUMB_CACHE_ON
+        THUMB_CACHE_ON = self.settings.value("thumb_cache", True, type=bool)
         # マウスを乗せたときの拡大表示
         self.hover_signals = LoaderSignals()
         self.hover_signals.thumb_done.connect(self._on_hover_image)
@@ -1670,7 +2109,10 @@ class MainWindow(QMainWindow):
         self.list.setViewMode(QListView.IconMode)
         self.list.setResizeMode(QListView.Adjust)
         self.list.setMovement(QListView.Static)
-        self.list.setUniformItemSizes(True)
+        self.list.setUniformItemSizes(False)
+        self.list.setItemDelegate(ThumbDelegate(self.list, self))
+        self.list.setContextMenuPolicy(Qt.CustomContextMenu)
+        self.list.customContextMenuRequested.connect(self._context_menu)
         self.list.setSelectionMode(QAbstractItemView.ExtendedSelection)
         self.list.setTextElideMode(Qt.ElideMiddle)
         self.list.setWordWrap(False)
@@ -1755,6 +2197,10 @@ class MainWindow(QMainWindow):
         self.a_trash = act("ゴミ箱へ", ["Delete"], self.trash_selected,
                            theme_icon(["user-trash"], S.SP_TrashIcon), True)
         self.a_selall = act("すべて選択", ["Ctrl+A"], self.list.selectAll, None, True)
+        self.a_rotr = act("右に90°回転して保存", ["Ctrl+Alt+R"], lambda: self.rotate_selected(True),
+                          theme_icon(["object-rotate-right"], S.SP_BrowserReload), True)
+        self.a_rotl = act("左に90°回転して保存", ["Ctrl+Alt+L"], lambda: self.rotate_selected(False),
+                          theme_icon(["object-rotate-left"], S.SP_BrowserReload), True)
         self.a_files = act("ファイルマネージャで開く", [], self.open_in_file_manager)
         self.a_map = act("地図で見る", ["Ctrl+G"], self.open_map,
                          theme_icon(["mark-location", "find-location", "applications-geography",
@@ -1783,8 +2229,12 @@ class MainWindow(QMainWindow):
         bar.addWidget(self.path_edit)
         bar.addWidget(QLabel("　並び順 "))
         self.sort_combo = QComboBox()
-        self.sort_combo.addItems(["名前", "更新日時", "サイズ"])
-        self.sort_combo.setCurrentIndex(int(self.settings.value("sort_key", 0)))
+        self.sort_combo.addItems([t for _k, t in SORT_MODES])
+        mode = self.settings.value("sort_mode", "")
+        if not mode:     # 0.3.0 までの設定を引き継ぐ
+            mode = {0: "name", 1: "mtime", 2: "size"}.get(int(self.settings.value("sort_key", 0)), "name")
+        keys = [k for k, _t in SORT_MODES]
+        self.sort_combo.setCurrentIndex(keys.index(mode) if mode in keys else 0)
         self.sort_combo.currentIndexChanged.connect(self._on_sort_changed)
         bar.addWidget(self.sort_combo)
         self.order_btn = QToolButton()
@@ -1813,7 +2263,8 @@ class MainWindow(QMainWindow):
         m.addSeparator()
         m.addAction(act("終了", ["Ctrl+Q"], self.close))
         m = mb.addMenu("編集(&E)")
-        for a in (self.a_rename, self.a_copy, self.a_move, self.a_trash, None, self.a_selall):
+        for a in (self.a_rotr, self.a_rotl, None, self.a_rename, self.a_copy, self.a_move, self.a_trash,
+                  None, self.a_selall):
             m.addSeparator() if a is None else m.addAction(a)
         m = mb.addMenu("表示(&V)")
         m.addAction(self.a_view)
@@ -1831,6 +2282,9 @@ class MainWindow(QMainWindow):
         self.a_upscale = act("小さい写真も画面いっぱいに拡大", [], self._toggle_upscale, checkable=True)
         self.a_upscale.setChecked(self.settings.value("upscale_small", False, type=bool))
         m.addAction(self.a_upscale)
+        self.a_tcache = act("サムネイルを保存して次回から速く表示", [], self._toggle_tcache, checkable=True)
+        self.a_tcache.setChecked(THUMB_CACHE_ON)
+        m.addAction(self.a_tcache)
         m = mb.addMenu("ヘルプ(&H)")
         m.addAction(act("キー操作の一覧", ["F1"], self.show_keys))
         m.addAction(act(f"{APP_NAME}について", [], self.show_about))
@@ -1861,16 +2315,14 @@ class MainWindow(QMainWindow):
         if p and os.path.normpath(p) != os.path.normpath(self.folder or ""):
             self.load_folder(p, sync_tree=False)
 
-    def _sort_entries(self, entries):
-        key = self.sort_combo.currentIndex()
-        desc = self.order_btn.isChecked()
-        if key == 1:
-            entries.sort(key=lambda e: (e[2], natural_key(e[0])), reverse=desc)
-        elif key == 2:
-            entries.sort(key=lambda e: (e[1], natural_key(e[0])), reverse=desc)
-        else:
-            entries.sort(key=lambda e: natural_key(e[0]), reverse=desc)
-        return entries
+    def sort_mode(self):
+        return SORT_MODES[self.sort_combo.currentIndex()][0]
+
+    def _taken_key(self, full, mtime):
+        c = self.taken_cache.get(full)
+        if c and c[0] == mtime and c[1]:
+            return c[1]
+        return datetime.datetime.fromtimestamp(mtime).strftime("%Y:%m:%d %H:%M:%S")
 
     def load_folder(self, path, keep_sel=False, sync_tree=True, select=None):
         if not path or not os.path.isdir(path):
@@ -1895,6 +2347,78 @@ class MainWindow(QMainWindow):
                 self.tree.scrollTo(idx)
                 self.tree.expand(idx)
 
+        entries, heic_skipped = [], 0
+        try:
+            with os.scandir(path) as it:
+                for e in it:
+                    try:
+                        if not e.is_file() or e.name.startswith("."):
+                            continue
+                        if is_image(e.name):
+                            st = e.stat()
+                            entries.append((e.name, st.st_size, st.st_mtime))
+                        elif os.path.splitext(e.name)[1].lower() in (".heic", ".heif"):
+                            heic_skipped += 1
+                    except OSError:
+                        continue
+        except PermissionError:
+            QMessageBox.warning(self, "開けません", "このフォルダを読む権限がありません。")
+        self.entries = entries
+        self._hint = (f"　｜　iPhoneの写真（HEIC）が {heic_skipped} 枚あります。"
+                      "表示するには kimageformat6-plugins を入れてください（F1）" if heic_skipped else "")
+        if self.list.verticalScrollBar():
+            self.list.verticalScrollBar().setValue(0)
+        self._populate(select=select, keep=prev_sel)
+        if self.sort_mode() == "taken":
+            self._scan_dates()
+
+    def _scan_dates(self):
+        """撮影日時がまだ分からない写真を裏で読み取る"""
+        if self.date_task is not None:
+            self.date_task.cancelled = True
+        missing = []
+        for name, _size, mtime in self.entries:
+            full = os.path.join(self.folder, name)
+            c = self.taken_cache.get(full)
+            if c is None or c[0] != mtime:
+                missing.append((full, mtime))
+        if not missing:
+            return
+        self.date_gen += 1
+        self.status.setText(f"撮影日時を読み取り中…（{len(missing)} 枚）")
+        self.date_task = DateScanTask(self.date_gen, missing, self.date_signals)
+        self.date_task.setAutoDelete(False)
+        self.date_pool.start(self.date_task)
+
+    def _on_dates(self, gen, res):
+        if gen != self.date_gen:
+            return
+        self.taken_cache.update(res)
+        self.date_task = None
+        if self.sort_mode() == "taken":
+            sb = self.list.verticalScrollBar()
+            pos = sb.value()
+            self._populate(keep=self.selected_paths(), scroll=False)
+            sb.setValue(pos)
+            self._vis_timer.start()
+
+    def _populate(self, select=None, keep=None, scroll=True):
+        """並べ替えて一覧を作り直す（撮影日時・更新日時のときは月ごとの見出し付き）"""
+        mode, desc, folder = self.sort_mode(), self.order_btn.isChecked(), self.folder
+        ents = list(self.entries)
+        if mode == "taken":
+            ents.sort(key=lambda e: (self._taken_key(os.path.join(folder, e[0]), e[2]),
+                                     natural_key(e[0])), reverse=desc)
+        elif mode == "mtime":
+            ents.sort(key=lambda e: (e[2], natural_key(e[0])), reverse=desc)
+        elif mode == "size":
+            ents.sort(key=lambda e: (e[1], natural_key(e[0])), reverse=desc)
+        else:
+            ents.sort(key=lambda e: natural_key(e[0]), reverse=desc)
+
+        # 作り直してもサムネイルを作り直さなくて済むように取っておく
+        old = {p: (it.icon(), it.data(THUMB_ROLE)) for p, it in self.items.items()
+               if it.data(THUMB_ROLE) == self.thumb_size}
         self._hover_cancel()
         self.gen += 1
         self.pool.clear()
@@ -1902,28 +2426,27 @@ class MainWindow(QMainWindow):
         self.items.clear()
         self.model.clear()
 
-        entries = []
-        try:
-            with os.scandir(path) as it:
-                for e in it:
-                    try:
-                        if e.is_file() and not e.name.startswith(".") and is_image(e.name):
-                            st = e.stat()
-                            entries.append((e.name, st.st_size, st.st_mtime))
-                    except OSError:
-                        continue
-        except PermissionError:
-            QMessageBox.warning(self, "開けません", "このフォルダを読む権限がありません。")
-        self._sort_entries(entries)
-
         ph = self._placeholder_icon()
+        last = None
         self.model.blockSignals(True)
-        for name, size, mtime in entries:
-            full = os.path.join(path, name)
-            it = QStandardItem(ph, name)
+        for name, size, mtime in ents:
+            full = os.path.join(folder, name)
+            if mode in ("taken", "mtime"):
+                k = (self._taken_key(full, mtime) if mode == "taken"
+                     else datetime.datetime.fromtimestamp(mtime).strftime("%Y:%m"))
+                label = f"{int(k[0:4])}年{int(k[5:7])}月"
+                if label != last:
+                    h = QStandardItem(label)
+                    h.setData(True, HEADER_ROLE)
+                    h.setFlags(Qt.ItemIsEnabled)
+                    self.model.appendRow(h)
+                    last = label
+            icon, tsize = old.get(full, (ph, None))
+            it = QStandardItem(icon, name)
             it.setData(full, PATH_ROLE)
             it.setData(size, SIZE_ROLE)
             it.setData(mtime, MTIME_ROLE)
+            it.setData(tsize, THUMB_ROLE)
             it.setToolTip(name)
             it.setEditable(False)
             self.items[full] = it
@@ -1932,14 +2455,13 @@ class MainWindow(QMainWindow):
         self._apply_grid()
         self.list.reset()
 
-        self.empty_label.setVisible(not entries)
+        self.empty_label.setVisible(not ents)
         self._place_empty_label()
-        self.status.setText(f"{len(entries)} 枚の写真")
         if select:
             self._select_path(select)
-        elif prev_sel:
-            for p in prev_sel:
-                self._select_path(p, add=True)
+        elif keep:
+            for i, p in enumerate(keep):
+                self._select_path(p, add=i > 0)
         self._on_selection()
         self._vis_timer.start()
 
@@ -1966,8 +2488,7 @@ class MainWindow(QMainWindow):
     def _apply_grid(self):
         s = self.thumb_size
         self.list.setIconSize(QSize(s, s))
-        fm = self.list.fontMetrics()
-        self.list.setGridSize(QSize(s + 20, s + fm.height() + 16))
+        self.list.doItemsLayout()
 
     def _apply_thumb_size(self):
         s = self.size_slider.value()
@@ -2000,7 +2521,7 @@ class MainWindow(QMainWindow):
                 continue
             it = self.model.itemFromIndex(idx)
             path = it.data(PATH_ROLE)
-            if it.data(THUMB_ROLE) == self.thumb_size or path in self.requested:
+            if path is None or it.data(THUMB_ROLE) == self.thumb_size or path in self.requested:
                 continue
             self.requested.add(path)
             self.pool.start(ThumbTask(self.gen, path, self.thumb_size, self.signals))
@@ -2128,13 +2649,19 @@ class MainWindow(QMainWindow):
 
     # --- 選択と情報 ---
     def selected_rows(self):
-        return sorted(i.row() for i in self.list.selectionModel().selectedIndexes())
+        return sorted(i.row() for i in self.list.selectionModel().selectedIndexes()
+                      if not i.data(HEADER_ROLE))
 
     def selected_paths(self):
         return [self.model.item(r).data(PATH_ROLE) for r in self.selected_rows()]
 
     def all_paths(self):
-        return [self.model.item(r).data(PATH_ROLE) for r in range(self.model.rowCount())]
+        out = []
+        for r in range(self.model.rowCount()):
+            p = self.model.item(r).data(PATH_ROLE)
+            if p:
+                out.append(p)
+        return out
 
     def _select_path(self, path, add=False):
         if path is None:
@@ -2150,10 +2677,10 @@ class MainWindow(QMainWindow):
 
     def _on_selection(self):
         paths = self.selected_paths()
-        total = self.model.rowCount()
+        total = len(self.items)
         if not paths:
             self.info.setHtml(info_html(None))
-            self.status.setText(f"{total} 枚の写真")
+            self.status.setText(f"{total} 枚の写真{self._hint}")
             return
         if len(paths) == 1:
             p = paths[0]
@@ -2168,10 +2695,12 @@ class MainWindow(QMainWindow):
 
     def _on_sort_changed(self, *_):
         self._update_order_text()
-        self.settings.setValue("sort_key", self.sort_combo.currentIndex())
+        self.settings.setValue("sort_mode", self.sort_mode())
         self.settings.setValue("sort_desc", self.order_btn.isChecked())
         if self.folder:
-            self.load_folder(self.folder, keep_sel=True)
+            self._populate(keep=self.selected_paths())
+            if self.sort_mode() == "taken":
+                self._scan_dates()
 
     def _update_order_text(self):
         self.order_btn.setText("▼ 降順" if self.order_btn.isChecked() else "▲ 昇順")
@@ -2183,9 +2712,14 @@ class MainWindow(QMainWindow):
         if not paths:
             return
         if row is None:
-            rows = self.selected_rows()
-            row = rows[0] if rows else 0
-        self._ensure_viewer().open_list(paths, row, slideshow=slideshow)
+            sel = self.selected_paths()
+            start = sel[0] if sel else paths[0]
+        else:
+            item = self.model.item(row)
+            start = item.data(PATH_ROLE) if item is not None else None
+            if not start:
+                return      # 見出しをダブルクリックしたとき
+        self._ensure_viewer().open_list(paths, paths.index(start), slideshow=slideshow)
 
     def _ensure_viewer(self):
         if self.viewer is None:
@@ -2193,6 +2727,7 @@ class MainWindow(QMainWindow):
             self.viewer.setWindowIcon(self.windowIcon())
             self.viewer.currentChanged.connect(lambda p: self._select_path(p))
             self.viewer.fileTrashed.connect(self._remove_path)
+            self.viewer.fileRotated.connect(self._refresh_thumb)
         self.viewer.view.upscale_small = self.a_upscale.isChecked()
         return self.viewer
 
@@ -2220,9 +2755,16 @@ class MainWindow(QMainWindow):
             self._hover_cancel()
         it = self.items.pop(path, None)
         if it is not None:
-            self.model.removeRow(it.row())
+            r = it.row()
+            self.model.removeRow(r)
+            # 中身が無くなった見出しも消す
+            prev = self.model.item(r - 1) if r > 0 else None
+            nxt = self.model.item(r) if r < self.model.rowCount() else None
+            if prev is not None and prev.data(HEADER_ROLE) and (nxt is None or nxt.data(HEADER_ROLE)):
+                self.model.removeRow(r - 1)
+        self.entries = [e for e in self.entries if os.path.join(self.folder, e[0]) != path]
         self.requested.discard(path)
-        self.empty_label.setVisible(self.model.rowCount() == 0)
+        self.empty_label.setVisible(not self.items)
         self._on_selection()
         self._vis_timer.start()
 
@@ -2247,8 +2789,81 @@ class MainWindow(QMainWindow):
             QMessageBox.warning(self, "一部失敗", "ゴミ箱へ移動できなかったもの：\n" + "\n".join(failed))
         n = self.model.rowCount()
         if n:
-            idx = self.model.index(min(next_row, n - 1), 0)
-            self.list.selectionModel().setCurrentIndex(idx, self.list.selectionModel().SelectionFlag.ClearAndSelect)
+            rows = list(range(min(next_row, n - 1), n)) + list(range(min(next_row, n - 1) - 1, -1, -1))
+            for r in rows:
+                if self.model.item(r).data(PATH_ROLE):
+                    idx = self.model.index(r, 0)
+                    self.list.selectionModel().setCurrentIndex(
+                        idx, self.list.selectionModel().SelectionFlag.ClearAndSelect)
+                    break
+
+    def rotate_selected(self, cw):
+        paths = self.selected_paths()
+        if not paths:
+            return
+        bad = [p for p in paths if not can_rotate_save(p)]
+        if bad:
+            QMessageBox.information(self, "回転して保存",
+                                    "この形式の写真は回転して保存できません：\n" +
+                                    "\n".join(os.path.basename(p) for p in bad[:10]))
+            paths = [p for p in paths if p not in bad]
+        failed, hows = [], set()
+        QApplication.setOverrideCursor(Qt.WaitCursor)
+        try:
+            for p in paths:
+                ok, how = rotate_and_save(p, cw)
+                if ok:
+                    hows.add(how)
+                    self._refresh_thumb(p)
+                else:
+                    failed.append(f"{os.path.basename(p)}（{how}）")
+                QApplication.processEvents()
+        finally:
+            QApplication.restoreOverrideCursor()
+        if failed:
+            QMessageBox.warning(self, "回転して保存", "保存できなかったもの：\n" + "\n".join(failed))
+        elif paths:
+            self.statusBar().showMessage(
+                f"{len(paths)} 枚を{'右' if cw else '左'}に回転して保存しました（{'・'.join(sorted(hows))}）", 6000)
+
+    def _refresh_thumb(self, path):
+        """回転などで写真が変わったら、サムネイル・情報を作り直す"""
+        self.hover_cache.pop(path, None)
+        if self.popup.path == path:
+            self._hover_cancel()
+        it = self.items.get(path)
+        if it is not None:
+            it.setData(None, THUMB_ROLE)
+            self.requested.discard(path)
+            self._vis_timer.start()
+        if self.viewer is not None:
+            self.viewer._cache.pop(path, None)
+        if self.map_win is not None:
+            self.map_win.view.thumbs.pop(path, None)
+            self.map_win.view.hover_cache.pop(path, None)
+            self.map_win.view.update()
+        if path in self.selected_paths():
+            self._sel_timer.start()
+
+    def _context_menu(self, pos):
+        idx = self.list.indexAt(pos)
+        if idx.isValid() and not idx.data(HEADER_ROLE):
+            if not self.list.selectionModel().isSelected(idx):
+                self.list.selectionModel().setCurrentIndex(
+                    idx, self.list.selectionModel().SelectionFlag.ClearAndSelect)
+        if not self.selected_paths():
+            return
+        self._hover_cancel()
+        m = QMenu(self)
+        for a in (self.a_view, self.a_slide, None, self.a_rotr, self.a_rotl, None,
+                  self.a_rename, self.a_copy, self.a_move, self.a_trash):
+            m.addSeparator() if a is None else m.addAction(a)
+        m.exec(self.list.viewport().mapToGlobal(pos))
+
+    def _toggle_tcache(self, on):
+        global THUMB_CACHE_ON
+        THUMB_CACHE_ON = on
+        self.settings.setValue("thumb_cache", on)
 
     def rename_selected(self):
         paths = self.selected_paths()
@@ -2356,6 +2971,7 @@ class MainWindow(QMainWindow):
             "  Backspace / Alt+↑ … 上のフォルダへ\n"
             "  Ctrl+I … 情報パネル　　Ctrl+R … 再読込\n"
             "  Ctrl+G … 地図で見る（位置情報付きの写真を地図に並べる）\n"
+            "  Ctrl+Alt+R / Ctrl+Alt+L … 右 / 左に回転して保存（右クリックメニューにもあります）\n"
             "  マウスを乗せる … サムネイルが大きくなる（表示メニューで切替）\n\n"
             "【大きく表示の画面】\n"
             "  → / Space / PageDown … 次へ\n"
@@ -2364,12 +2980,16 @@ class MainWindow(QMainWindow):
             "  マウスホイール / + / - … 拡大・縮小\n"
             "  0 … 画面に合わせる　　1 … 等倍（100%）\n"
             "  ドラッグ … 写真を動かす\n"
-            "  R / L … 右回転 / 左回転（表示だけ。ファイルは変わりません）\n"
+            "  R / L … 右回転 / 左回転（見た目だけ）\n"
+            "  Ctrl+S … 今の向きで保存（JPEGは画質そのまま）\n"
             "  S … スライドショー開始・停止\n"
             "  F / F11 / ダブルクリック … 全画面\n"
             "  I … 撮影情報を重ねて表示\n"
             "  Delete … ゴミ箱へ\n"
-            "  Esc … スライドショー停止 → 全画面解除 → 閉じる"))
+            "  Esc … スライドショー停止 → 全画面解除 → 閉じる\n\n"
+            "【iPhoneの写真（HEIC）を表示するには】\n"
+            "  端末で次を実行してから、ながめ窓を起動し直してください：\n"
+            "  sudo apt install kimageformat6-plugins libheif-plugin-libde265"))
 
     def show_about(self):
         QMessageBox.about(self, f"{APP_NAME}について", (

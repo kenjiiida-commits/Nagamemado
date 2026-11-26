@@ -9,7 +9,10 @@ Ubuntu用の写真閲覧ソフトです。Python + PySide6 で動きます。
 - 地図で見る（Ctrl+G）：位置情報付きの写真を地理院地図の上にサムネイルで並べる。近い写真はまとめて枚数を表示、マウスを乗せると「ポン」と拡大、クリックで表示
 - スライドショー（間隔・繰り返しは「表示」メニューで設定）
 - ゴミ箱へ移動・名前変更・別フォルダへのコピー／移動
-- 並び順（名前・更新日時・サイズ）とサムネイルの大きさを変更
+- 並び順（名前・撮影日時・更新日時・サイズ）とサムネイルの大きさを変更。日時で並べると「2026年10月」のように月ごとの見出しが付きます
+- 回転して保存：JPEGは画質を落とさず向きの情報だけ書き換えます（更新日時は元のまま）
+- サムネイルを Ubuntu 標準の場所（~/.cache/thumbnails）に保存し、2回目から一瞬で表示（「ファイル」アプリと共有）
+- iPhone の写真（HEIC）にも対応（下の「HEICについて」）
 - サムネイルにマウスを乗せると「ポン」と大きく表示（表示メニューで切り替え）
 - フォルダや写真をウィンドウにドラッグ＆ドロップで開く
 
@@ -17,7 +20,7 @@ Ubuntu用の写真閲覧ソフトです。Python + PySide6 で動きます。
 
 ## インストール（DEB）
 ```
-sudo apt install ./nagamemado_0.3.0_all.deb
+sudo apt install ./nagamemado_0.4.0_all.deb
 ```
 
 ## DEBを使わずに動かす
@@ -25,6 +28,13 @@ sudo apt install ./nagamemado_0.3.0_all.deb
 sudo apt install python3-pyside6.qtwidgets python3-pyside6.qtnetwork python3-pil qt6-image-formats-plugins
 python3 nagamemado.py
 ```
+
+## HEICについて
+iPhone の写真（.heic）を表示するには、次の部品を入れてください。
+```
+sudo apt install kimageformat6-plugins libheif-plugin-libde265
+```
+撮影日時・位置情報（地図）は、ながめ窓が HEIC から直接読み取ります。
 
 ## 地図について
 地図は国土地理院の地理院タイルを使っています（出典：国土地理院）。表示した地図は ~/.cache に一時保存されます。

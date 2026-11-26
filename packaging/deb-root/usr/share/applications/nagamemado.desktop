@@ -9,5 +9,5 @@ Icon=nagamemado
 Terminal=false
 Categories=Graphics;Viewer;Photography;Qt;
 Keywords=photo;image;viewer;写真;画像;ビューア;スライドショー;
-MimeType=image/jpeg;image/png;image/gif;image/bmp;image/webp;image/tiff;image/heif;image/avif;image/x-tga;image/x-portable-pixmap;image/svg+xml;
+MimeType=image/jpeg;image/png;image/gif;image/bmp;image/webp;image/tiff;image/heif;image/heic;image/avif;image/x-tga;image/x-portable-pixmap;image/svg+xml;
 StartupWMClass=nagamemado
