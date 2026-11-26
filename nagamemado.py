@@ -22,7 +22,8 @@ from collections import OrderedDict
 
 from PySide6.QtCore import (
     Qt, QObject, QRunnable, QThreadPool, Signal, QSize, QSettings, QTimer,
-    QDir, QFile, QStandardPaths, QUrl, QRectF,
+    QDir, QFile, QStandardPaths, QUrl, QRectF, QRect, QPoint,
+    QPropertyAnimation, QEasingCurve, QEvent,
 )
 from PySide6.QtGui import (
     QImageReader, QImage, QPixmap, QIcon, QStandardItemModel, QStandardItem,
@@ -44,7 +45,7 @@ except Exception:  # Pillow が無くても動くようにする
 
 APP_NAME = "ながめ窓"
 APP_ID = "nagamemado"
-VERSION = "0.1.0"
+VERSION = "0.2.0"
 
 PATH_ROLE = Qt.UserRole + 1
 SIZE_ROLE = Qt.UserRole + 2
@@ -813,6 +814,44 @@ class ViewerWindow(QMainWindow):
 
 
 # ----------------------------------------------------------------------
+# マウスを乗せたサムネイルが「ポン」と大きくなる部品
+# ----------------------------------------------------------------------
+class HoverPopup(QLabel):
+    """メイン窓の上に重ねて表示する拡大サムネイル（クリックは下に素通り）"""
+
+    def __init__(self, parent):
+        super().__init__(parent)
+        self.setAttribute(Qt.WA_TransparentForMouseEvents)
+        self.setScaledContents(True)
+        self.setStyleSheet("QLabel{background:#222;border:3px solid #3a3a3a;border-radius:3px}")
+        self.anim = QPropertyAnimation(self, b"geometry", self)
+        self.anim.setDuration(160)
+        self.anim.setEasingCurve(QEasingCurve.OutBack)   # 少し行き過ぎて戻る「ポン」の動き
+        self.path = None
+        self.hide()
+
+    def pop(self, path, pixmap, start_rect, target_rect):
+        self.path = path
+        self.setPixmap(pixmap)
+        self.anim.stop()
+        self.setGeometry(start_rect)
+        self.show()
+        self.raise_()
+        self.anim.setStartValue(start_rect)
+        self.anim.setEndValue(target_rect)
+        self.anim.start()
+
+    def update_pixmap(self, path, pixmap):
+        if self.isVisible() and path == self.path:
+            self.setPixmap(pixmap)
+
+    def dismiss(self):
+        self.anim.stop()
+        self.path = None
+        self.hide()
+
+
+# ----------------------------------------------------------------------
 # メイン窓（フォルダ＋サムネイル一覧）
 # ----------------------------------------------------------------------
 class MainWindow(QMainWindow):
@@ -832,6 +871,14 @@ class MainWindow(QMainWindow):
         self.signals.thumb_done.connect(self._on_thumb)
         self.viewer = None
         self._placeholder = None
+        # マウスを乗せたときの拡大表示
+        self.hover_signals = LoaderSignals()
+        self.hover_signals.thumb_done.connect(self._on_hover_image)
+        self.hover_cache = OrderedDict()
+        self.hover_pending = set()
+        self._hover_path = None
+        self.popup = HoverPopup(self)
+        self._hover_timer = QTimer(self, singleShot=True, interval=220, timeout=self._show_hover)
 
         self._build_ui()
         self._build_actions()
@@ -874,6 +921,9 @@ class MainWindow(QMainWindow):
         self.list.selectionModel().selectionChanged.connect(lambda *_: self._sel_timer.start())
         self.list.verticalScrollBar().valueChanged.connect(lambda *_: self._vis_timer.start())
         self.list.installEventFilter(self)
+        self.list.setMouseTracking(True)
+        self.list.viewport().installEventFilter(self)
+        self.list.verticalScrollBar().valueChanged.connect(lambda *_: self._hover_cancel())
         self.empty_label = QLabel("このフォルダには写真がありません", self.list.viewport())
         self.empty_label.setStyleSheet("color:gray;font-size:12pt")
         self.empty_label.hide()
@@ -1011,6 +1061,9 @@ class MainWindow(QMainWindow):
         self.a_loop = act("スライドショーを繰り返す", [], self._toggle_loop, checkable=True)
         self.a_loop.setChecked(self.settings.value("slide_loop", True, type=bool))
         m.addAction(self.a_loop)
+        self.a_hover = act("マウスを乗せるとサムネイルを拡大", [], self._toggle_hover, checkable=True)
+        self.a_hover.setChecked(self.settings.value("hover_zoom", True, type=bool))
+        m.addAction(self.a_hover)
         self.a_upscale = act("小さい写真も画面いっぱいに拡大", [], self._toggle_upscale, checkable=True)
         self.a_upscale.setChecked(self.settings.value("upscale_small", False, type=bool))
         m.addAction(self.a_upscale)
@@ -1076,6 +1129,7 @@ class MainWindow(QMainWindow):
                 self.tree.scrollTo(idx)
                 self.tree.expand(idx)
 
+        self._hover_cancel()
         self.gen += 1
         self.pool.clear()
         self.requested.clear()
@@ -1155,6 +1209,8 @@ class MainWindow(QMainWindow):
             return
         self.thumb_size = s
         self.settings.setValue("thumb_size", s)
+        self.hover_cache.clear()
+        self._hover_cancel()
         self.gen += 1
         self.pool.clear()
         self.requested.clear()
@@ -1211,7 +1267,98 @@ class MainWindow(QMainWindow):
                 return True
         if obj is self.list and ev.type() == ev.Type.Resize:
             self._vis_timer.start()
+        if obj is self.list.viewport():
+            t = ev.type()
+            if t == QEvent.MouseMove:
+                self._hover_move(ev.position().toPoint())
+            elif t in (QEvent.Leave, QEvent.MouseButtonPress, QEvent.MouseButtonDblClick,
+                       QEvent.Wheel, QEvent.Hide):
+                self._hover_cancel()
         return super().eventFilter(obj, ev)
+
+    # --- マウスを乗せたサムネイルの拡大 ---
+    def _hover_size(self):
+        return max(280, min(520, int(self.thumb_size * 2.2)))
+
+    def _hover_move(self, pos):
+        idx = self.list.indexAt(pos)
+        path = self.model.itemFromIndex(idx).data(PATH_ROLE) if idx.isValid() else None
+        if path == self._hover_path:
+            return
+        self._hover_path = path
+        self.popup.dismiss()
+        if path and self.a_hover.isChecked():
+            self._hover_timer.start()
+        else:
+            self._hover_timer.stop()
+
+    def _hover_cancel(self):
+        self._hover_timer.stop()
+        self._hover_path = None
+        self.popup.dismiss()
+
+    def _show_hover(self):
+        path = self._hover_path
+        it = self.items.get(path)
+        if it is None or not self.isActiveWindow() and QApplication.activeWindow() is not None:
+            return
+        if it.data(THUMB_ROLE) is None:
+            return   # まだサムネイルができていない
+        s = self.thumb_size
+        cell = self.list.visualRect(it.index())
+        center_vp = QPoint(cell.center().x(), cell.top() + 4 + s // 2)
+        center = self.list.viewport().mapTo(self, center_vp)
+
+        pm = self.hover_cache.get(path)
+        if pm is None:
+            pm = it.icon().pixmap(QSize(s, s))
+            if path not in self.hover_pending:
+                self.hover_pending.add(path)
+                QThreadPool.globalInstance().start(
+                    ThumbTask(0, path, self._hover_size(), self.hover_signals))
+        else:
+            self.hover_cache.move_to_end(path)
+        if pm.isNull():
+            return
+        w, h = pm.width(), pm.height()
+        k = s / max(w, h)
+        start = QRect(0, 0, max(1, int(w * k)), max(1, int(h * k)))
+        start.moveCenter(center)
+        big = self._hover_size()
+        k = big / max(w, h)
+        target = QRect(0, 0, int(w * k), int(h * k))
+        target.moveCenter(center)
+        # 窓からはみ出さないように寄せる
+        area = self.centralWidget().geometry().adjusted(6, 6, -6, -6)
+        if target.left() < area.left():
+            target.moveLeft(area.left())
+        if target.right() > area.right():
+            target.moveRight(area.right())
+        if target.top() < area.top():
+            target.moveTop(area.top())
+        if target.bottom() > area.bottom():
+            target.moveBottom(area.bottom())
+        self.popup.pop(path, pm, start, target)
+
+    def _on_hover_image(self, _gen, path, img):
+        self.hover_pending.discard(path)
+        if img.isNull():
+            return
+        pm = QPixmap.fromImage(img)
+        self.hover_cache[path] = pm
+        while len(self.hover_cache) > 40:
+            self.hover_cache.popitem(last=False)
+        self.popup.update_pixmap(path, pm)
+
+    def _toggle_hover(self, on):
+        self.settings.setValue("hover_zoom", on)
+        if not on:
+            self._hover_cancel()
+
+    def changeEvent(self, e):
+        if e.type() == QEvent.ActivationChange and not self.isActiveWindow():
+            self._hover_cancel()
+        super().changeEvent(e)
 
     # --- 選択と情報 ---
     def selected_rows(self):
@@ -1265,6 +1412,7 @@ class MainWindow(QMainWindow):
 
     # --- ビューア ---
     def open_viewer(self, row=None, slideshow=False):
+        self._hover_cancel()
         paths = self.all_paths()
         if not paths:
             return
@@ -1280,6 +1428,9 @@ class MainWindow(QMainWindow):
         self.viewer.open_list(paths, row, slideshow=slideshow)
 
     def _remove_path(self, path):
+        self.hover_cache.pop(path, None)
+        if self.popup.path == path:
+            self._hover_cancel()
         it = self.items.pop(path, None)
         if it is not None:
             self.model.removeRow(it.row())
@@ -1416,7 +1567,8 @@ class MainWindow(QMainWindow):
             "  F2 … 名前変更　　Delete … ゴミ箱へ\n"
             "  Ctrl+Shift+C … コピー　　Ctrl+Shift+M … 移動\n"
             "  Backspace / Alt+↑ … 上のフォルダへ\n"
-            "  Ctrl+I … 情報パネル　　Ctrl+R … 再読込\n\n"
+            "  Ctrl+I … 情報パネル　　Ctrl+R … 再読込\n"
+            "  マウスを乗せる … サムネイルが大きくなる（表示メニューで切替）\n\n"
             "【大きく表示の画面】\n"
             "  → / Space / PageDown … 次へ\n"
             "  ← / Backspace / PageUp … 前へ\n"
