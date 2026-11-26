@@ -14,6 +14,7 @@ License: MIT
 
 import os
 import re
+import math
 import sys
 import shutil
 import subprocess
@@ -23,11 +24,15 @@ from collections import OrderedDict
 from PySide6.QtCore import (
     Qt, QObject, QRunnable, QThreadPool, Signal, QSize, QSettings, QTimer,
     QDir, QFile, QStandardPaths, QUrl, QRectF, QRect, QPoint,
-    QPropertyAnimation, QEasingCurve, QEvent,
+    QPropertyAnimation, QEasingCurve, QEvent, QPointF,
 )
 from PySide6.QtGui import (
     QImageReader, QImage, QPixmap, QIcon, QStandardItemModel, QStandardItem,
     QAction, QKeySequence, QPainter, QColor, QDesktopServices, QImageIOHandler,
+    QFont, QPen, QBrush, QPainterPath,
+)
+from PySide6.QtNetwork import (
+    QNetworkAccessManager, QNetworkRequest, QNetworkReply, QNetworkDiskCache,
 )
 from PySide6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QSplitter, QTreeView, QListView,
@@ -35,6 +40,7 @@ from PySide6.QtWidgets import (
     QDockWidget, QTextBrowser, QVBoxLayout, QHBoxLayout, QGraphicsView,
     QGraphicsScene, QGraphicsPixmapItem, QMessageBox, QInputDialog,
     QFileDialog, QAbstractItemView, QStyle, QToolButton, QFrame, QSizePolicy,
+    QCheckBox,
 )
 
 try:
@@ -45,7 +51,7 @@ except Exception:  # Pillow が無くても動くようにする
 
 APP_NAME = "ながめ窓"
 APP_ID = "nagamemado"
-VERSION = "0.2.0"
+VERSION = "0.3.0"
 
 PATH_ROLE = Qt.UserRole + 1
 SIZE_ROLE = Qt.UserRole + 2
@@ -852,6 +858,759 @@ class HoverPopup(QLabel):
 
 
 # ----------------------------------------------------------------------
+# 地図で見る：位置情報の読み取り
+# ----------------------------------------------------------------------
+def read_gps(path):
+    """(緯度, 経度, 撮影日時文字列) を返す。位置情報が無ければ None"""
+    if not HAS_PIL:
+        return None
+    try:
+        with Image.open(path) as im:
+            ex = im.getexif()
+            if not ex:
+                return None
+            try:
+                gps = dict(ex.get_ifd(0x8825))
+            except Exception:
+                return None
+            if 2 not in gps or 4 not in gps:
+                return None
+            lat = _dms_to_deg(gps[2], gps.get(1, "N"))
+            lon = _dms_to_deg(gps[4], gps.get(3, "E"))
+            if lat is None or lon is None or (abs(lat) < 1e-6 and abs(lon) < 1e-6):
+                return None
+            if not (-90 <= lat <= 90 and -180 <= lon <= 180):
+                return None
+            try:
+                sub = dict(ex.get_ifd(0x8769))
+            except Exception:
+                sub = {}
+            dt = _clean(sub.get(36867) or ex.get(306) or "")
+            return lat, lon, dt
+    except Exception:
+        return None
+
+
+def pretty_date(dt):
+    try:
+        d = datetime.datetime.strptime(dt, "%Y:%m:%d %H:%M:%S")
+        return d.strftime("%Y/%m/%d %H:%M")
+    except Exception:
+        return ""
+
+
+class GpsSignals(QObject):
+    found = Signal(int, list, int)   # 世代, [(path, lat, lon, 日時)], 読んだ枚数
+    done = Signal(int, int)
+
+
+class GpsScanTask(QRunnable):
+    def __init__(self, gen, paths, signals):
+        super().__init__()
+        self.gen, self.paths, self.signals = gen, paths, signals
+        self.cancelled = False
+
+    def run(self):
+        batch = []
+        try:
+            for i, p in enumerate(self.paths, 1):
+                if self.cancelled:
+                    return
+                g = read_gps(p)
+                if g:
+                    batch.append((p,) + g)
+                if len(batch) >= 30 or (i % 200 == 0):
+                    self.signals.found.emit(self.gen, batch, i)
+                    batch = []
+            self.signals.found.emit(self.gen, batch, len(self.paths))
+            self.signals.done.emit(self.gen, len(self.paths))
+        except RuntimeError:
+            pass  # アプリ終了中
+
+
+# ----------------------------------------------------------------------
+# 地図で見る：地理院タイルの地図
+# ----------------------------------------------------------------------
+TILE = 256
+MIN_Z, MAX_Z = 3, 18
+TILE_SOURCES = [   # 表示名, 地理院タイルの名前, 拡張子
+    ("標準地図", "std", "png"),
+    ("淡色地図", "pale", "png"),
+    ("写真", "seamlessphoto", "jpg"),
+]
+
+
+def lonlat_to_world(lon, lat, z):
+    n = TILE * (2 ** z)
+    lat = max(-85.0511, min(85.0511, lat))
+    s = math.sin(math.radians(lat))
+    x = (lon + 180.0) / 360.0 * n
+    y = (0.5 - math.log((1 + s) / (1 - s)) / (4 * math.pi)) * n
+    return x, y
+
+
+class MapView(QWidget):
+    photoActivated = Signal(list, int)   # 開く写真の一覧, 何枚目か
+    MARK = 56          # 地図上のサムネイルの大きさ
+    POP = 300          # ポンと大きくしたときの大きさ
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setMouseTracking(True)
+        self.setFocusPolicy(Qt.StrongFocus)
+        self.setMinimumSize(400, 300)
+        self.source = TILE_SOURCES[0]
+        self.z = 5
+        self.cx, self.cy = lonlat_to_world(137.0, 37.0, self.z)
+        self.photos = []        # (path, lat, lon, 日時)
+        self.clusters = []      # (wx, wy, [写真の番号])
+        self._cluster_z = None
+        self._marker_rects = []
+        self.message = ""
+        self.net_error = False
+
+        self.tiles = OrderedDict()
+        self.tile_pending = {}
+        self.nam = QNetworkAccessManager(self)
+        cache = QNetworkDiskCache(self)
+        cdir = QStandardPaths.writableLocation(QStandardPaths.CacheLocation)
+        cache.setCacheDirectory(os.path.join(cdir or os.path.expanduser("~/.cache/nagamemado"), "tiles"))
+        cache.setMaximumCacheSize(300 * 1024 * 1024)
+        self.nam.setCache(cache)
+
+        self.pool = QThreadPool(self)
+        self.pool.setMaxThreadCount(3)
+        self.thumbs = {}
+        self.thumb_pending = set()
+        self.sig = LoaderSignals()
+        self.sig.thumb_done.connect(self._on_thumb)
+        self.hover_cache = OrderedDict()
+        self.hover_pending = set()
+        self.hsig = LoaderSignals()
+        self.hsig.thumb_done.connect(self._on_hover_img)
+
+        self.popup = HoverPopup(self)
+        self._hover_cluster = None
+        self._hover_info = None
+        self._hover_timer = QTimer(self, singleShot=True, interval=200, timeout=self._show_hover)
+        self._drag = None
+        self._moved = False
+        self._wheel_acc = 0
+
+    # --- 写真データ ---
+    def clear_photos(self):
+        self.photos = []
+        self._cluster_z = None
+        self._hover_cancel()
+        self.update()
+
+    def add_photos(self, items):
+        self.photos.extend(items)
+        self.photos.sort(key=lambda t: (t[3] or "9999", natural_key(os.path.basename(t[0]))))
+        self._cluster_z = None
+        self.update()
+
+    def remove_path(self, path):
+        n = len(self.photos)
+        self.photos = [t for t in self.photos if t[0] != path]
+        if len(self.photos) != n:
+            self._cluster_z = None
+            self._hover_cancel()
+            self.update()
+
+    def set_source(self, i):
+        self.source = TILE_SOURCES[i]
+        self.update()
+
+    def reload_tiles(self):
+        self.tiles.clear()
+        self.net_error = False
+        self.update()
+
+    # --- 位置と拡大率 ---
+    def center_lonlat(self):
+        n = TILE * (2 ** self.z)
+        lon = self.cx / n * 360.0 - 180.0
+        lat = math.degrees(math.atan(math.sinh(math.pi * (1 - 2 * self.cy / n))))
+        return lon, lat
+
+    def set_zoom(self, nz, anchor=None):
+        nz = max(MIN_Z, min(MAX_Z, nz))
+        if nz == self.z:
+            return
+        if anchor is None:
+            anchor = QPointF(self.width() / 2, self.height() / 2)
+        ax = anchor.x() - self.width() / 2
+        ay = anchor.y() - self.height() / 2
+        f = 2 ** (nz - self.z)
+        self.cx = (self.cx + ax) * f - ax
+        self.cy = (self.cy + ay) * f - ay
+        self.z = nz
+        self._cluster_z = None
+        self._hover_cancel()
+        self.update()
+
+    def fit_points(self, pts, max_z=16):
+        """[(lat, lon)] がすべて見えるように合わせる"""
+        if not pts:
+            return
+        w, h = max(100, self.width() - 120), max(100, self.height() - 120)
+        lats = [p[0] for p in pts]
+        lons = [p[1] for p in pts]
+        z = max_z
+        while z > MIN_Z:
+            x0, y0 = lonlat_to_world(min(lons), max(lats), z)
+            x1, y1 = lonlat_to_world(max(lons), min(lats), z)
+            if x1 - x0 <= w and y1 - y0 <= h:
+                break
+            z -= 1
+        x0, y0 = lonlat_to_world(min(lons), max(lats), z)
+        x1, y1 = lonlat_to_world(max(lons), min(lats), z)
+        self.z = z
+        self.cx, self.cy = (x0 + x1) / 2, (y0 + y1) / 2
+        self._cluster_z = None
+        self._hover_cancel()
+        self.update()
+
+    def fit_all(self):
+        self.fit_points([(t[1], t[2]) for t in self.photos], max_z=15)
+
+    # --- 地図タイル ---
+    def _tile(self, z, x, y):
+        key = (self.source[1], z, x, y)
+        pm = self.tiles.get(key)
+        if pm is not None:
+            self.tiles.move_to_end(key)
+            return pm
+        if key not in self.tile_pending:
+            name, ext = self.source[1], self.source[2]
+            url = f"https://cyberjapandata.gsi.go.jp/xyz/{name}/{z}/{x}/{y}.{ext}"
+            req = QNetworkRequest(QUrl(url))
+            req.setRawHeader(b"User-Agent", f"Nagamemado/{VERSION}".encode())
+            req.setAttribute(QNetworkRequest.CacheLoadControlAttribute, QNetworkRequest.PreferCache)
+            reply = self.nam.get(req)
+            self.tile_pending[key] = reply
+            reply.finished.connect(lambda k=key, r=reply: self._tile_done(k, r))
+        return None
+
+    def _tile_done(self, key, reply):
+        self.tile_pending.pop(key, None)
+        err = reply.error()
+        if err == QNetworkReply.NoError:
+            pm = QPixmap()
+            if pm.loadFromData(reply.readAll()):
+                self.tiles[key] = pm
+                self.net_error = False
+            else:
+                self.tiles[key] = QPixmap()
+        elif err == QNetworkReply.ContentNotFoundError:
+            self.tiles[key] = QPixmap()     # その場所の地図は無い
+        elif err != QNetworkReply.OperationCanceledError:
+            self.tiles[key] = QPixmap()
+            self.net_error = True
+        while len(self.tiles) > 600:
+            self.tiles.popitem(last=False)
+        reply.deleteLater()
+        self.update()
+
+    def _fallback(self, z, x, y):
+        """まだ届いていないタイルの代わりに、粗い地図を拡大して使う"""
+        for d in range(1, 5):
+            pz = z - d
+            if pz < 0:
+                break
+            pm = self.tiles.get((self.source[1], pz, x >> d, y >> d))
+            if pm is not None and not pm.isNull():
+                sub = TILE >> d
+                return pm, QRectF((x - ((x >> d) << d)) * sub, (y - ((y >> d) << d)) * sub, sub, sub)
+        return None, None
+
+    # --- 写真のまとめ（近い写真をひとまとめ） ---
+    def _recluster(self):
+        # 画面上で近すぎる写真（マーク1個分以内）を1つの束にまとめる
+        cell = self.MARK + 20
+        grid = {}
+        groups = []     # [合計x, 合計y, [番号], 種のx, 種のy]
+        for i, (_p, lat, lon, _d) in enumerate(self.photos):
+            wx, wy = lonlat_to_world(lon, lat, self.z)
+            gx, gy = int(wx // cell), int(wy // cell)
+            best, bd = None, cell * cell
+            for dx in (-1, 0, 1):
+                for dy in (-1, 0, 1):
+                    for gi in grid.get((gx + dx, gy + dy), ()):
+                        g = groups[gi]
+                        d = (g[3] - wx) ** 2 + (g[4] - wy) ** 2
+                        if d < bd:
+                            best, bd = gi, d
+            if best is None:
+                grid.setdefault((gx, gy), []).append(len(groups))
+                groups.append([wx, wy, [i], wx, wy])
+            else:
+                g = groups[best]
+                g[0] += wx
+                g[1] += wy
+                g[2].append(i)
+        self.clusters = [(sx / len(ix), sy / len(ix), ix) for sx, sy, ix, _a, _b in groups]
+        self.clusters.sort(key=lambda c: c[1])   # 下にあるものを手前に描く
+        self._cluster_z = self.z
+
+    # --- 描画 ---
+    def paintEvent(self, _e):
+        p = QPainter(self)
+        p.setRenderHint(QPainter.SmoothPixmapTransform)
+        p.fillRect(self.rect(), QColor(232, 232, 228))
+        w, h = self.width(), self.height()
+        n = 2 ** self.z
+        left, top = self.cx - w / 2, self.cy - h / 2
+        visible = set()
+        for ty in range(math.floor(top / TILE), math.floor((top + h) / TILE) + 1):
+            if ty < 0 or ty >= n:
+                continue
+            for tx in range(math.floor(left / TILE), math.floor((left + w) / TILE) + 1):
+                x = tx % n
+                target = QRectF(round(tx * TILE - left), round(ty * TILE - top), TILE, TILE)
+                visible.add((self.source[1], self.z, x, ty))
+                pm = self._tile(self.z, x, ty)
+                if pm is not None and not pm.isNull():
+                    p.drawPixmap(target.topLeft(), pm)
+                else:
+                    fpm, src = self._fallback(self.z, x, ty)
+                    if fpm is not None:
+                        p.drawPixmap(target, fpm, src)
+        # 見えなくなったタイルの読み込みはやめる
+        for key, reply in list(self.tile_pending.items()):
+            if key not in visible:
+                reply.abort()
+
+        self._draw_markers(p, left, top)
+        self._draw_overlay(p)
+        p.end()
+
+    def _draw_markers(self, p, left, top):
+        if self._cluster_z != self.z:
+            self._recluster()
+        self._marker_rects = []
+        p.setRenderHint(QPainter.Antialiasing)
+        M = self.MARK
+        for ci, (wx, wy, idxs) in enumerate(self.clusters):
+            sx, sy = wx - left, wy - top
+            if sx < -M or sy < -M or sx > self.width() + M or sy > self.height() + M:
+                continue
+            path = self.photos[idxs[0]][0]
+            pm = self.thumbs.get(path)
+            if pm is None:
+                self._request_thumb(path)
+                tw = th = M
+            elif pm.isNull():
+                tw = th = M
+            else:
+                k = M / max(pm.width(), pm.height())
+                tw, th = max(1, int(pm.width() * k)), max(1, int(pm.height() * k))
+            r = QRect(int(sx - tw / 2), int(sy - th / 2), tw, th)
+            if len(idxs) > 1:   # 重なった写真の束に見せる
+                p.setPen(QPen(QColor(0, 0, 0, 60), 1))
+                p.setBrush(QColor(245, 245, 245))
+                p.drawRect(r.adjusted(4, -4, 4, -4).adjusted(-3, -3, 3, 3))
+            p.setPen(Qt.NoPen)
+            p.setBrush(QColor(0, 0, 0, 70))
+            p.drawRoundedRect(r.adjusted(-2, 0, 4, 5), 3, 3)          # 影
+            p.setBrush(QColor(255, 255, 255))
+            p.drawRoundedRect(r.adjusted(-3, -3, 3, 3), 3, 3)         # 白い枠
+            if pm is not None and not pm.isNull():
+                p.drawPixmap(r, pm)
+            else:
+                p.fillRect(r, QColor(200, 200, 200))
+            if len(idxs) > 1:
+                txt = str(len(idxs)) if len(idxs) < 1000 else "999+"
+                f = QFont(self.font())
+                f.setBold(True)
+                f.setPointSizeF(8.5)
+                p.setFont(f)
+                bw = max(20, p.fontMetrics().horizontalAdvance(txt) + 10)
+                badge = QRect(r.right() - bw // 2, r.top() - 10, bw, 20)
+                p.setPen(QPen(QColor(255, 255, 255), 2))
+                p.setBrush(QColor(230, 90, 40))
+                p.drawRoundedRect(badge, 10, 10)
+                p.setPen(Qt.white)
+                p.drawText(badge, Qt.AlignCenter, txt)
+            self._marker_rects.append((r.adjusted(-3, -10, 10, 3), ci))
+
+    def _draw_overlay(self, p):
+        # 出典表示（地理院タイルの利用ルール）
+        f = QFont(self.font())
+        f.setPointSizeF(8.5)
+        p.setFont(f)
+        txt = "出典：国土地理院（地理院タイル）"
+        fm = p.fontMetrics()
+        tr = QRect(0, 0, fm.horizontalAdvance(txt) + 12, fm.height() + 4)
+        tr.moveBottomRight(self.rect().bottomRight() - QPoint(2, 2))
+        p.setPen(Qt.NoPen)
+        p.setBrush(QColor(255, 255, 255, 200))
+        p.drawRect(tr)
+        p.setPen(QColor(60, 60, 60))
+        p.drawText(tr, Qt.AlignCenter, txt)
+
+        msg = self.message
+        if self.net_error:
+            msg = "地図を読み込めません。インターネット接続を確認してください。"
+        if msg:
+            f.setPointSizeF(11)
+            p.setFont(f)
+            fm = p.fontMetrics()
+            mr = QRect(0, 0, fm.horizontalAdvance(msg) + 30, fm.height() + 16)
+            mr.moveCenter(QPoint(self.width() // 2, 34))
+            p.setBrush(QColor(0, 0, 0, 170))
+            p.drawRoundedRect(mr, 8, 8)
+            p.setPen(Qt.white)
+            p.drawText(mr, Qt.AlignCenter, msg)
+
+    # --- サムネイル ---
+    def _request_thumb(self, path):
+        if path not in self.thumb_pending:
+            self.thumb_pending.add(path)
+            self.pool.start(ThumbTask(0, path, self.MARK * 2, self.sig))
+
+    def _on_thumb(self, _g, path, img):
+        self.thumb_pending.discard(path)
+        self.thumbs[path] = QPixmap.fromImage(img) if not img.isNull() else QPixmap()
+        self.update()
+
+    # --- マウス ---
+    def _hit(self, pos):
+        for r, ci in reversed(self._marker_rects):
+            if r.contains(pos):
+                return ci
+        return None
+
+    def mousePressEvent(self, e):
+        if e.button() == Qt.LeftButton:
+            self._drag = (e.position(), self.cx, self.cy)
+            self._moved = False
+            self._hover_cancel()
+            self.setCursor(Qt.ClosedHandCursor)
+
+    def mouseMoveEvent(self, e):
+        if self._drag is not None and e.buttons() & Qt.LeftButton:
+            start, cx, cy = self._drag
+            d = e.position() - start
+            if abs(d.x()) + abs(d.y()) > 4:
+                self._moved = True
+            if self._moved:
+                self.cx, self.cy = cx - d.x(), cy - d.y()
+                self.update()
+            return
+        self._hover_move(e.position().toPoint())
+
+    def mouseReleaseEvent(self, e):
+        if e.button() != Qt.LeftButton or self._drag is None:
+            return
+        self.unsetCursor()
+        self._drag = None
+        if not self._moved:
+            ci = self._hit(e.position().toPoint())
+            if ci is not None:
+                self._activate(ci)
+
+    def mouseDoubleClickEvent(self, e):
+        if self._hit(e.position().toPoint()) is None:
+            self.set_zoom(self.z + 1, e.position())
+
+    def wheelEvent(self, e):
+        self._wheel_acc += e.angleDelta().y()
+        while self._wheel_acc >= 120:
+            self._wheel_acc -= 120
+            self.set_zoom(self.z + 1, e.position())
+        while self._wheel_acc <= -120:
+            self._wheel_acc += 120
+            self.set_zoom(self.z - 1, e.position())
+        e.accept()
+
+    def keyPressEvent(self, e):
+        k = e.key()
+        if k in (Qt.Key_Plus, Qt.Key_Equal):
+            self.set_zoom(self.z + 1)
+        elif k == Qt.Key_Minus:
+            self.set_zoom(self.z - 1)
+        elif k in (Qt.Key_Left, Qt.Key_Right, Qt.Key_Up, Qt.Key_Down):
+            step = 120
+            self.cx += {Qt.Key_Left: -step, Qt.Key_Right: step}.get(k, 0)
+            self.cy += {Qt.Key_Up: -step, Qt.Key_Down: step}.get(k, 0)
+            self._hover_cancel()
+            self.update()
+        else:
+            super().keyPressEvent(e)
+
+    def leaveEvent(self, e):
+        self._hover_cancel()
+        super().leaveEvent(e)
+
+    def resizeEvent(self, e):
+        self._hover_cancel()
+        super().resizeEvent(e)
+
+    def _activate(self, ci):
+        _wx, _wy, idxs = self.clusters[ci]
+        paths = [self.photos[i][0] for i in idxs]
+        pts = [(self.photos[i][1], self.photos[i][2]) for i in idxs]
+        spread = max(max(a for a, _ in pts) - min(a for a, _ in pts),
+                     max(b for _, b in pts) - min(b for _, b in pts))
+        if len(paths) == 1 or self.z >= MAX_Z or spread < 1e-5:
+            self._hover_cancel()
+            self.photoActivated.emit(paths, 0)
+        else:
+            old = self.z
+            self.fit_points(pts, max_z=MAX_Z)
+            if self.z <= old:            # 拡大できないときは写真を開く
+                self.photoActivated.emit(paths, 0)
+
+    # --- ポンと大きくする ---
+    def _hover_move(self, pos):
+        ci = self._hit(pos)
+        key = None if ci is None else (self.z, ci)
+        if key == self._hover_cluster:
+            return
+        self._hover_cluster = key
+        self.popup.dismiss()
+        if key is None:
+            self._hover_timer.stop()
+            self.unsetCursor()
+        else:
+            self.setCursor(Qt.PointingHandCursor)
+            self._hover_timer.start()
+
+    def _hover_cancel(self):
+        self._hover_timer.stop()
+        self._hover_cluster = None
+        self._hover_info = None
+        self.popup.dismiss()
+
+    def _compose(self, pm, date, count):
+        """大きくした写真の下に、撮影日時と枚数を書き込む"""
+        if pm.isNull():
+            return pm
+        out = QPixmap(pm)
+        p = QPainter(out)
+        p.setRenderHint(QPainter.Antialiasing)
+        k = max(out.width(), out.height()) / self.POP
+        bar = int(26 * max(k, 0.4))
+        p.fillRect(0, out.height() - bar, out.width(), bar, QColor(0, 0, 0, 150))
+        f = QFont(self.font())
+        f.setPixelSize(max(8, int(14 * max(k, 0.4))))
+        p.setFont(f)
+        p.setPen(Qt.white)
+        txt = date or "撮影日時なし"
+        if count > 1:
+            txt += f"　（ほか {count - 1} 枚）"
+        p.drawText(QRect(8, out.height() - bar, out.width() - 16, bar), Qt.AlignVCenter | Qt.AlignLeft, txt)
+        p.end()
+        return out
+
+    def _show_hover(self):
+        key = self._hover_cluster
+        if key is None or key[0] != self.z or key[1] >= len(self.clusters):
+            return
+        rect = None
+        for r, ci in self._marker_rects:
+            if ci == key[1]:
+                rect = r.adjusted(3, 10, -10, -3)
+        if rect is None:
+            return
+        _wx, _wy, idxs = self.clusters[key[1]]
+        path, _lat, _lon, dt = self.photos[idxs[0]]
+        date = pretty_date(dt)
+        self._hover_info = (path, date, len(idxs))
+        pm = self.hover_cache.get(path)
+        if pm is None:
+            pm = self.thumbs.get(path)
+            if path not in self.hover_pending:
+                self.hover_pending.add(path)
+                self.pool.start(ThumbTask(0, path, self.POP, self.hsig))
+        if pm is None or pm.isNull():
+            return
+        w, h = pm.width(), pm.height()
+        k = self.POP / max(w, h)
+        target = QRect(0, 0, int(w * k), int(h * k))
+        target.moveCenter(rect.center())
+        area = self.rect().adjusted(6, 6, -6, -6)
+        if target.left() < area.left():
+            target.moveLeft(area.left())
+        if target.right() > area.right():
+            target.moveRight(area.right())
+        if target.top() < area.top():
+            target.moveTop(area.top())
+        if target.bottom() > area.bottom():
+            target.moveBottom(area.bottom())
+        self.popup.pop(path, self._compose(pm, date, len(idxs)), rect, target)
+
+    def _on_hover_img(self, _g, path, img):
+        self.hover_pending.discard(path)
+        if img.isNull():
+            return
+        pm = QPixmap.fromImage(img)
+        self.hover_cache[path] = pm
+        while len(self.hover_cache) > 40:
+            self.hover_cache.popitem(last=False)
+        if self._hover_info and self._hover_info[0] == path:
+            _p, date, count = self._hover_info
+            self.popup.update_pixmap(path, self._compose(pm, date, count))
+
+
+class MapWindow(QMainWindow):
+    """地図で見る窓"""
+    MAX_FILES = 30000
+
+    def __init__(self, main):
+        super().__init__()
+        self.main = main
+        self.settings = main.settings
+        self.setWindowTitle(f"地図で見る - {APP_NAME}")
+        self.resize(1100, 760)
+        self.folder = None
+        self.gen = 0
+        self.task = None
+        self.total = 0
+        self.scan_pool = QThreadPool(self)
+        self.scan_pool.setMaxThreadCount(1)
+        self.gsig = GpsSignals()
+        self.gsig.found.connect(self._on_found)
+        self.gsig.done.connect(self._on_done)
+
+        self.view = MapView()
+        self.setCentralWidget(self.view)
+        self.view.photoActivated.connect(self.main.open_viewer_paths)
+
+        S = QStyle.StandardPixmap
+        tb = QToolBar("地図")
+        tb.setMovable(False)
+        tb.setToolButtonStyle(Qt.ToolButtonTextBesideIcon)
+        self.addToolBar(tb)
+        tb.addWidget(QLabel(" 地図の種類 "))
+        self.src_combo = QComboBox()
+        self.src_combo.addItems([s[0] for s in TILE_SOURCES])
+        self.src_combo.setCurrentIndex(int(self.settings.value("map_source", 0)))
+        self.src_combo.currentIndexChanged.connect(self._on_source)
+        self.view.set_source(self.src_combo.currentIndex())
+        tb.addWidget(self.src_combo)
+        tb.addSeparator()
+        a = QAction(theme_icon(["zoom-fit-best"], S.SP_TitleBarMaxButton), "全部の写真を表示", self)
+        a.setShortcut(QKeySequence("0"))
+        a.triggered.connect(self.view.fit_all)
+        tb.addAction(a)
+        a = QAction(theme_icon(["zoom-in"], S.SP_ArrowUp), "拡大", self)
+        a.triggered.connect(lambda: self.view.set_zoom(self.view.z + 1))
+        tb.addAction(a)
+        a = QAction(theme_icon(["zoom-out"], S.SP_ArrowDown), "縮小", self)
+        a.triggered.connect(lambda: self.view.set_zoom(self.view.z - 1))
+        tb.addAction(a)
+        tb.addSeparator()
+        self.sub_check = QCheckBox("サブフォルダの写真も含める")
+        self.sub_check.setChecked(self.settings.value("map_recursive", False, type=bool))
+        self.sub_check.toggled.connect(self._on_recursive)
+        tb.addWidget(self.sub_check)
+        tb.addSeparator()
+        a = QAction(theme_icon(["view-refresh"], S.SP_BrowserReload), "読み直す", self)
+        a.triggered.connect(lambda: (self.view.reload_tiles(), self.load_folder(self.folder, force=True)))
+        tb.addAction(a)
+        a = QAction("閉じる", self)
+        a.setShortcut(QKeySequence("Esc"))
+        a.triggered.connect(self.close)
+        self.addAction(a)
+
+        self.status = QLabel()
+        self.statusBar().addWidget(self.status, 1)
+        self.statusBar().addPermanentWidget(QLabel("ドラッグで移動・ホイールで拡大縮小・写真をクリックで表示　"))
+
+        geo = self.settings.value("map_geometry")
+        if geo is not None:
+            self.restoreGeometry(geo)
+
+    def _on_source(self, i):
+        self.settings.setValue("map_source", i)
+        self.view.set_source(i)
+
+    def _on_recursive(self, on):
+        self.settings.setValue("map_recursive", on)
+        self.load_folder(self.folder, force=True)
+
+    def _collect(self, folder):
+        paths = []
+        if self.sub_check.isChecked():
+            for root, dirs, files in os.walk(folder):
+                dirs[:] = sorted(d for d in dirs if not d.startswith("."))
+                for f in sorted(files, key=natural_key):
+                    if not f.startswith(".") and is_image(f):
+                        paths.append(os.path.join(root, f))
+                        if len(paths) >= self.MAX_FILES:
+                            return paths
+        else:
+            try:
+                with os.scandir(folder) as it:
+                    for e in it:
+                        if e.is_file() and not e.name.startswith(".") and is_image(e.name):
+                            paths.append(e.path)
+            except OSError:
+                pass
+        return paths
+
+    def load_folder(self, folder, force=False):
+        if not folder:
+            return
+        if folder == self.folder and not force:
+            return
+        self.folder = folder
+        self.setWindowTitle(f"地図で見る：{os.path.basename(folder) or folder} - {APP_NAME}")
+        self.gen += 1
+        if self.task is not None:
+            self.task.cancelled = True
+        self.view.clear_photos()
+        self.view.message = ""
+        if not HAS_PIL:
+            self.view.message = "位置情報を読むには python3-pil が必要です"
+            self.status.setText("")
+            return
+        QApplication.setOverrideCursor(Qt.WaitCursor)
+        try:
+            paths = self._collect(folder)
+        finally:
+            QApplication.restoreOverrideCursor()
+        self.total = len(paths)
+        self._fitted = False
+        self.status.setText(f"位置情報を読み取り中… 0 / {self.total} 枚")
+        self.task = GpsScanTask(self.gen, paths, self.gsig)
+        self.task.setAutoDelete(False)
+        self.scan_pool.start(self.task)
+
+    def _on_found(self, gen, items, scanned):
+        if gen != self.gen:
+            return
+        if items:
+            self.view.add_photos(items)
+            if not self._fitted:       # 最初に見つかった写真のあたりを先に見せる
+                self.view.fit_all()
+                self._fitted = True
+        self.status.setText(f"位置情報を読み取り中… {scanned} / {self.total} 枚"
+                            f"（位置情報あり {len(self.view.photos)} 枚）")
+
+    def _on_done(self, gen, total):
+        if gen != self.gen:
+            return
+        n = len(self.view.photos)
+        self.view.fit_all()
+        if n == 0:
+            self.view.message = ("このフォルダには写真がありません" if total == 0
+                                 else "このフォルダには位置情報付きの写真がありません")
+            self.view.update()
+        self.status.setText(f"位置情報のある写真 {n} 枚 ／ 全部で {total} 枚")
+
+    def closeEvent(self, e):
+        self.settings.setValue("map_geometry", self.saveGeometry())
+        if self.task is not None:
+            self.task.cancelled = True
+        self.view._hover_cancel()
+        super().closeEvent(e)
+
+
+# ----------------------------------------------------------------------
 # メイン窓（フォルダ＋サムネイル一覧）
 # ----------------------------------------------------------------------
 class MainWindow(QMainWindow):
@@ -870,6 +1629,7 @@ class MainWindow(QMainWindow):
         self.signals = LoaderSignals()
         self.signals.thumb_done.connect(self._on_thumb)
         self.viewer = None
+        self.map_win = None
         self._placeholder = None
         # マウスを乗せたときの拡大表示
         self.hover_signals = LoaderSignals()
@@ -996,12 +1756,15 @@ class MainWindow(QMainWindow):
                            theme_icon(["user-trash"], S.SP_TrashIcon), True)
         self.a_selall = act("すべて選択", ["Ctrl+A"], self.list.selectAll, None, True)
         self.a_files = act("ファイルマネージャで開く", [], self.open_in_file_manager)
+        self.a_map = act("地図で見る", ["Ctrl+G"], self.open_map,
+                         theme_icon(["mark-location", "find-location", "applications-geography",
+                                     "internet-web-browser"], S.SP_DriveNetIcon))
         self.a_info = self.dock.toggleViewAction()
         self.a_info.setText("情報パネル")
         self.a_info.setShortcut(QKeySequence("Ctrl+I"))
         self.a_info.setIcon(theme_icon(["dialog-information"], S.SP_MessageBoxInformation))
 
-        for a in (self.a_open, self.a_up, self.a_reload, None, self.a_view, self.a_slide, None,
+        for a in (self.a_open, self.a_up, self.a_reload, None, self.a_view, self.a_slide, self.a_map, None,
                   self.a_rename, self.a_copy, self.a_move, self.a_trash, None, self.a_info):
             if a is None:
                 tb.addSeparator()
@@ -1055,6 +1818,7 @@ class MainWindow(QMainWindow):
         m = mb.addMenu("表示(&V)")
         m.addAction(self.a_view)
         m.addAction(self.a_slide)
+        m.addAction(self.a_map)
         m.addAction(self.a_info)
         m.addSeparator()
         m.addAction(act("スライドショーの間隔…", [], self.set_interval))
@@ -1117,6 +1881,8 @@ class MainWindow(QMainWindow):
         prev_sel = self.selected_paths() if keep_sel else []
         self.folder = path
         self.settings.setValue("last_folder", path)
+        if self.map_win is not None and self.map_win.isVisible():
+            self.map_win.load_folder(path)
         self.path_edit.setText(path)
         self.setWindowTitle(f"{os.path.basename(path) or path} - {APP_NAME}")
 
@@ -1419,15 +2185,36 @@ class MainWindow(QMainWindow):
         if row is None:
             rows = self.selected_rows()
             row = rows[0] if rows else 0
+        self._ensure_viewer().open_list(paths, row, slideshow=slideshow)
+
+    def _ensure_viewer(self):
         if self.viewer is None:
             self.viewer = ViewerWindow(self.settings)
             self.viewer.setWindowIcon(self.windowIcon())
             self.viewer.currentChanged.connect(lambda p: self._select_path(p))
             self.viewer.fileTrashed.connect(self._remove_path)
         self.viewer.view.upscale_small = self.a_upscale.isChecked()
-        self.viewer.open_list(paths, row, slideshow=slideshow)
+        return self.viewer
+
+    def open_viewer_paths(self, paths, index=0):
+        """地図などから、写真の一覧を指定して大きく表示する"""
+        if paths:
+            self._ensure_viewer().open_list(paths, index)
+
+    def open_map(self):
+        if not self.folder:
+            return
+        if self.map_win is None:
+            self.map_win = MapWindow(self)
+            self.map_win.setWindowIcon(self.windowIcon())
+        self.map_win.show()
+        self.map_win.raise_()
+        self.map_win.activateWindow()
+        self.map_win.load_folder(self.folder)
 
     def _remove_path(self, path):
+        if self.map_win is not None:
+            self.map_win.view.remove_path(path)
         self.hover_cache.pop(path, None)
         if self.popup.path == path:
             self._hover_cancel()
@@ -1568,6 +2355,7 @@ class MainWindow(QMainWindow):
             "  Ctrl+Shift+C … コピー　　Ctrl+Shift+M … 移動\n"
             "  Backspace / Alt+↑ … 上のフォルダへ\n"
             "  Ctrl+I … 情報パネル　　Ctrl+R … 再読込\n"
+            "  Ctrl+G … 地図で見る（位置情報付きの写真を地図に並べる）\n"
             "  マウスを乗せる … サムネイルが大きくなる（表示メニューで切替）\n\n"
             "【大きく表示の画面】\n"
             "  → / Space / PageDown … 次へ\n"
@@ -1617,6 +2405,8 @@ class MainWindow(QMainWindow):
         self.pool.clear()
         if self.viewer:
             self.viewer.close()
+        if self.map_win:
+            self.map_win.close()
         super().closeEvent(e)
 
 

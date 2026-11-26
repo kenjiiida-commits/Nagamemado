@@ -6,6 +6,7 @@ Ubuntu用の写真閲覧ソフトです。Python + PySide6 で動きます。
 - 左のフォルダツリーから選ぶと、写真をサムネイルで一覧表示
 - ダブルクリック／Enter で大きく表示（マウスホイールで拡大縮小、ドラッグで移動、R / L で回転）
 - 撮影情報（EXIF）の表示：撮影日時・カメラ・シャッター速度・絞り・ISO・焦点距離・撮影場所（地理院地図へのリンク）
+- 地図で見る（Ctrl+G）：位置情報付きの写真を地理院地図の上にサムネイルで並べる。近い写真はまとめて枚数を表示、マウスを乗せると「ポン」と拡大、クリックで表示
 - スライドショー（間隔・繰り返しは「表示」メニューで設定）
 - ゴミ箱へ移動・名前変更・別フォルダへのコピー／移動
 - 並び順（名前・更新日時・サイズ）とサムネイルの大きさを変更
@@ -16,14 +17,17 @@ Ubuntu用の写真閲覧ソフトです。Python + PySide6 で動きます。
 
 ## インストール（DEB）
 ```
-sudo apt install ./nagamemado_0.2.0_all.deb
+sudo apt install ./nagamemado_0.3.0_all.deb
 ```
 
 ## DEBを使わずに動かす
 ```
-sudo apt install python3-pyside6.qtwidgets python3-pil qt6-image-formats-plugins
+sudo apt install python3-pyside6.qtwidgets python3-pyside6.qtnetwork python3-pil qt6-image-formats-plugins
 python3 nagamemado.py
 ```
+
+## 地図について
+地図は国土地理院の地理院タイルを使っています（出典：国土地理院）。表示した地図は ~/.cache に一時保存されます。
 
 ## ライセンス
 MIT License（作者：飯田顕治）
